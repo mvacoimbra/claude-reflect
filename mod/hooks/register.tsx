@@ -1,10 +1,31 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, PluginOptions, Register, RenderElement, Timer } from 'claude-code'
 
-import type { Learning, SavedRule } from '../types'
+import type {
+  Learning,
+  ReflectActArgs,
+  ReflectActResult,
+  ReflectCatalogEntry,
+  ReflectItem,
+  ReflectLang,
+  ReflectPanel,
+  ReflectPanelArgs,
+  ReflectSection,
+  SavedRule,
+  Settings,
+} from '../types'
+import { action, empty, icon, kitOf, staticTree, text } from './kit/kit'
+import type { Kit, KitUi } from './kit/kit'
+import { toneOf } from './kit/tone'
+import type { KitSkin } from './kit/tone'
+import { WORDS } from './words'
+import type { Words } from './words'
+
+const DEFAULTS: Settings = { paused: false, model: 'haiku' }
 
 const pending = atom({ plugin: 'reflect-mod', key: 'pending' } as const, [])
 const savedThisSession = atom({ plugin: 'reflect-mod', key: 'savedThisSession' } as const, [])
+const settings = atom({ plugin: 'reflect-mod', key: 'settings' } as const, DEFAULTS)
 
 /** Longer prompts are task briefs and pastes, not corrections (unless they say "remember:"). */
 const MAX_PROMPT = 500
@@ -13,6 +34,16 @@ const MIN_CONFIDENCE = 0.7
 const MAX_ITEMS = 300
 const MAX_QUEUE = 20
 const BAND_ROWS = 2
+/** Found rules the /mods tab lists before it says how many more wait. */
+const PANEL_ROWS = 6
+/** Saved and skipped rules the /mods tab lists, newest first. */
+const HISTORY_ROWS = 6
+/** How often a session reads the store again: other sessions' settings and decisions. */
+const SYNC_MS = 3000
+const MODELS = [
+  { value: 'haiku', label: 'Haiku' },
+  { value: 'sonnet', label: 'Sonnet' },
+]
 /** Two rules this alike (ordered word pairs) are the same rule. */
 const SAME = 0.6
 const START = '<!-- claude-reflect: learned rules (saved from the band; edit freely) -->'
@@ -32,11 +63,15 @@ const SECRET = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
 ]
 
-// The module's own: a reload drops them; the store keeps the learnings themselves.
-let model = 'haiku'
+// The module's own: a reload drops them; the store keeps the learnings and the settings.
+/** The model userConfig named, the fallback until the user picks one in /mods. */
+let configuredModel = DEFAULTS.model
+/** The language of the band and the toasts: the one the hub last asked for, else the environment's. */
+let lang: ReflectLang = 'en'
 let isDraining = false
 /** Saves to CLAUDE.md files run one after another inside this session. */
 let writing: Promise<unknown> = Promise.resolve()
+let sync: Timer | undefined
 const queue: string[] = []
 
 /** Ordered word pairs, short words kept: "pnpm, not npm" and "npm, not pnpm" share none. */
@@ -139,6 +174,9 @@ export function withRule(file: string, rule: string): string | undefined {
   return `${file.slice(0, end)}- ${rule}\n${file.slice(end)}`
 }
 
+// ---------------------------------------------------------------------------
+// The store: the learnings and the user's settings, one file shared by every session.
+
 async function items($: EngineInterface): Promise<Learning[]> {
   const got = await $.store.get('items')
   return Array.isArray(got) ? (got as Learning[]) : []
@@ -155,12 +193,46 @@ async function saveItems($: EngineInterface, list: Learning[]) {
   await $.store.set('items', kept)
 }
 
+async function stored($: EngineInterface, key: string): Promise<unknown> {
+  try {
+    return await $.store.get(key)
+  } catch {
+    return undefined
+  }
+}
+
+/** The settings as stored now: the store wins, then userConfig's model, then the defaults. */
+async function storedSettings($: EngineInterface): Promise<Settings> {
+  const paused = await stored($, 'paused')
+  const model = await stored($, 'model')
+  return {
+    paused: paused === true,
+    model: typeof model === 'string' && model.trim() !== '' ? model.trim() : configuredModel,
+  }
+}
+
+/** Reads the settings again; the atom changes only when a stored value did. */
+async function syncSettings($: EngineInterface): Promise<Settings> {
+  const next = await storedSettings($)
+  const was = await read($, settings)
+  if (was.paused !== next.paused || was.model !== next.model) await update($, settings, () => next)
+  return next
+}
+
+/** Writes one setting to the user's store at once, and to this session's atom. */
+async function setSetting($: EngineInterface, patch: Partial<Settings>) {
+  for (const [key, value] of Object.entries(patch)) await $.store.set(key, value)
+  await update($, settings, prev => ({ ...prev, ...patch }))
+}
+
+const waitingFirst = (a: Learning, b: Learning) => b.count - a.count || b.lastAt - a.lastAt
+
+/** What the band draws: this project's and the global rules still waiting. A no-op when nothing changed. */
 async function refreshBand($: EngineInterface) {
   const root = await $.session.root()
-  const mine = (await items($))
-    .filter(l => l.status === 'pending' && (l.scope === 'global' || l.project === root))
-    .sort((a, b) => b.count - a.count || b.lastAt - a.lastAt)
-  await update($, pending, () => mine)
+  const mine = (await items($)).filter(l => l.status === 'pending' && (l.scope === 'global' || l.project === root)).sort(waitingFirst)
+  const was = await read($, pending)
+  if (JSON.stringify(was) !== JSON.stringify(mine)) await update($, pending, () => mine)
 }
 
 async function fileFor($: EngineInterface, scope: 'global' | 'project', root: string) {
@@ -220,20 +292,22 @@ async function lastReply($: EngineInterface) {
 
 /** One prompt, end to end. Everything slow happens here, outside the prompt's own dispatch. */
 async function checkOne($: EngineInterface, text: string) {
-  if ((await $.store.get('paused')) === true) return
+  // Read the store, not the atom: another session may have paused a moment ago.
+  const s = await syncSettings($)
+  if (s.paused) return
   const root = await $.session.root()
   const told = remembered(text)
   if (told !== undefined) {
     const rule = cleanRule(told)
     if (rule === undefined) {
-      $.ui.toast('reflect: not kept - one line, no secrets, at most 200 characters')
+      $.ui.toast(WORDS[lang].notKept)
       return
     }
     await record($, { isRule: true, rule, scope: 'global', confidence: 1 }, root, true)
     return
   }
   const r = await $.model.complete({
-    model,
+    model: s.model,
     system: SYSTEM,
     prompt: checkPrompt(text, await lastReply($), root),
     maxTokens: 300,
@@ -268,6 +342,7 @@ async function decide($: EngineInterface, id: string, status: Learning['status']
   const one = list.find(l => l.id === id)
   if (one !== undefined && one.status === 'pending') {
     one.status = status
+    one.decidedAt = await $.clock.now()
     if (scope !== undefined) one.scope = scope
     if (project !== undefined) one.project = project
   }
@@ -275,55 +350,381 @@ async function decide($: EngineInterface, id: string, status: Learning['status']
   await refreshBand($)
 }
 
-/** Writes the rule to the CLAUDE.md the button names, after reading it again just before the write. */
-async function saveTo($: EngineInterface, l: Learning, scope: 'global' | 'project') {
+/** The learning as the store holds it now, while it still waits for a decision. */
+async function waiting($: EngineInterface, id: string): Promise<Learning | undefined> {
+  return (await items($)).find(one => one.id === id && one.status === 'pending')
+}
+
+/**
+ * Writes the rule to the CLAUDE.md the press names, after reading it again just before the write.
+ * Answers what to tell the person.
+ */
+async function saveTo($: EngineInterface, id: string, scope: 'global' | 'project'): Promise<string> {
+  const w = WORDS[lang]
+  let message = w.gone
   const job = writing.then(async () => {
-    const latest = (await items($)).find(one => one.id === l.id)
-    if (latest === undefined || latest.status !== 'pending') return
+    const latest = await waiting($, id)
+    if (latest === undefined) {
+      await refreshBand($)
+      return
+    }
     const root = await $.session.root()
     const path = await fileFor($, scope, root)
     const before = await readText($, path)
-    const after = withRule(before, l.rule)
+    const after = withRule(before, latest.rule)
     if (after === undefined) {
-      $.ui.toast(`reflect: the claude-reflect markers in ${path} are broken - fix them by hand, nothing written`)
+      message = w.brokenMarkers(path)
       return
     }
     if (after !== before) await $.fs.write(path, after)
-    await decide($, l.id, 'saved', scope, root)
-    await update($, savedThisSession, rules => [...rules, { rule: l.rule, scope, project: root }])
-    $.ui.toast(after === before ? `reflect: already in ${path}` : `reflect: saved to ${path}`)
+    await decide($, id, 'saved', scope, root)
+    await update($, savedThisSession, rules => [...rules, { rule: latest.rule, scope, project: root }])
+    message = after === before ? w.alreadyIn(path) : w.savedTo(path)
   })
   writing = job.catch(() => undefined)
   await job
+  return message
 }
 
-async function skip($: EngineInterface, l: Learning) {
-  await decide($, l.id, 'skipped')
-}
-
-/** Puts the rule in an empty prompt box to reword; submitting it comes back as a "remember:" learning. */
-async function edit($: EngineInterface, l: Learning) {
-  const box = await $.prompt.read()
-  if (box.text.trim() !== '') {
-    $.ui.toast('reflect: clear the prompt box first - Edit puts the rule there')
-    return
+async function skip($: EngineInterface, id: string): Promise<string> {
+  if ((await waiting($, id)) === undefined) {
+    await refreshBand($)
+    return WORDS[lang].gone
   }
-  const filled = await $.prompt.fill({ text: `remember: ${l.rule}` })
-  if (filled.isFilled) await decide($, l.id, 'skipped')
+  await decide($, id, 'skipped')
+  return WORDS[lang].skippedOne
 }
 
-export const register: Register = (on, options) => {
-  if (typeof options.model === 'string' && options.model.trim() !== '') model = options.model.trim()
+/**
+ * Puts the rule in an empty prompt box to reword; submitting it comes back as a "remember:" learning.
+ * Answers whether it did, and what to tell the person.
+ */
+async function edit($: EngineInterface, id: string): Promise<{ isDone: boolean; message: string }> {
+  const w = WORDS[lang]
+  const l = await waiting($, id)
+  if (l === undefined) {
+    await refreshBand($)
+    return { isDone: false, message: w.gone }
+  }
+  const box = await $.prompt.read()
+  if (box.text.trim() !== '') return { isDone: false, message: w.clearBox }
+  const filled = await $.prompt.fill({ text: `remember: ${l.rule}` })
+  if (!filled.isFilled) return { isDone: false, message: w.clearBox }
+  await decide($, l.id, 'skipped')
+  return { isDone: true, message: w.edited }
+}
+
+// ---------------------------------------------------------------------------
+// The drawing: one grammar for the band, the /mods tab's rows and the catalog, from the kit.
+
+// The skin every mod wears, from skins; Claude Code's own colours without it.
+async function skinOf($: EngineInterface): Promise<KitSkin | null> {
+  try {
+    return await $.skins.palette()
+  } catch {
+    return null
+  }
+}
+
+type Press = () => void
+type Presses = { save: Press; other: Press; edit: Press; skip: Press }
+
+const noop: Press = () => undefined
+const NO_PRESS: Presses = { save: noop, other: noop, edit: noop, skip: noop }
+
+const scopeWord = (w: Words, scope: Learning['scope']) => (scope === 'project' ? w.project : w.global)
+
+/** "This repo · said 2×": where the rule goes and how often it came up. */
+const metaOf = (w: Words, l: Learning, at?: number) =>
+  [scopeWord(w, l.scope), l.count > 1 ? w.said(l.count) : '', at === undefined ? '' : w.ago(Math.max(0, at - l.lastAt))].filter(Boolean).join(' · ')
+
+/** The rule's presses: Edit and Skip plain, the other file secondary, the save in the accent and last. */
+function ruleButtons(k: Kit, w: Words, l: Learning, p: Presses): RenderElement[] {
+  return [
+    action(k, `edit:${l.id}`, w.edit, p.edit),
+    action(k, `skip:${l.id}`, w.skip, p.skip),
+    action(k, `other:${l.id}`, l.scope === 'project' ? w.globalInstead : w.projectInstead, p.other, { dim: true }),
+    action(k, `save:${l.id}`, l.scope === 'project' ? w.saveProject : w.saveGlobal, p.save, { primary: true }),
+  ]
+}
+
+/**
+ * Cells the buttons take side by side, a cell between them: a desktop's native button is about its label and three
+ * cells of chrome, the terminal's its label and four.
+ */
+const buttonsWidth = (k: Kit, w: Words, l: Learning) =>
+  [w.edit, w.skip, l.scope === 'project' ? w.globalInstead : w.projectInstead, l.scope === 'project' ? w.saveProject : w.saveGlobal].reduce(
+    (sum, label) => sum + label.length + (k.vector ? 4 : 5),
+    0,
+  )
+
+/**
+ * One found rule as the band draws it: the reflect icon, the rule in body text, its scope muted under it, the
+ * buttons at the end when the rule fits beside them, under it when not.
+ */
+function bandRule(k: Kit, w: Words, l: Learning, p: Presses): RenderElement {
+  const { Box } = k.ui
+  const lead = icon(k, 'reflect', 'muted')
+  const meta = k.vector ? metaOf(w, l) : `reflect · ${metaOf(w, l)}`
+  const indent = lead === null ? 0 : 3
+  const isBeside = indent + l.rule.length + 2 + buttonsWidth(k, w, l) <= k.columns
+  const buttons = ruleButtons(k, w, l, p)
+  return (
+    <Box key={`band-rule:${l.id}`} flexDirection="column">
+      <Box flexDirection="row" columnGap={1} alignItems="flex-start">
+        {lead}
+        <Box flexDirection="column" flexGrow={1} flexShrink={1}>
+          {text(k, l.rule, undefined, { wrap: 'wrap' })}
+          {text(k, meta, 'muted')}
+        </Box>
+        {isBeside ? (
+          <Box flexDirection="row" columnGap={1} flexShrink={0} alignItems="center">
+            {buttons}
+          </Box>
+        ) : null}
+      </Box>
+      {isBeside ? null : (
+        <Box flexDirection="row" flexWrap="wrap" columnGap={1} paddingLeft={indent}>
+          {buttons}
+        </Box>
+      )}
+    </Box>
+  )
+}
+
+/** The band: the first rules waiting, a line apart, then how many more wait in /mods; other mods' bands beneath. */
+function bandTree(k: Kit, w: Words, list: readonly Learning[], pressesOf: (l: Learning) => Presses, below?: unknown): RenderElement {
+  const { Box } = k.ui
+  return (
+    <Box flexDirection="column">
+      <Box flexDirection="column" rowGap={1}>
+        {list.slice(0, BAND_ROWS).map(l => bandRule(k, w, l, pressesOf(l)))}
+        {list.length > BAND_ROWS ? text(k, w.more(list.length - BAND_ROWS), 'muted', { key: 'band-more' }) : null}
+      </Box>
+      {(below ?? null) as RenderElement | null}
+    </Box>
+  )
+}
+
+/** A found rule as the /mods tab lists it: the rule, then its scope, count and age. Its presses follow it as actions. */
+function pendingRow(k: Kit, w: Words, l: Learning, at: number): RenderElement {
+  const { Box } = k.ui
+  return (
+    <Box key={`pending:${l.id}`} flexDirection="column">
+      {text(k, l.rule, undefined, { wrap: 'wrap' })}
+      {text(k, metaOf(w, l, at), 'muted')}
+    </Box>
+  )
+}
+
+/** A saved or skipped rule: the rule, then the decision in its state's colour, where it went and when. */
+function decidedRow(k: Kit, w: Words, l: Learning, at: number): RenderElement {
+  const { Box } = k.ui
+  const isSaved = l.status === 'saved'
+  return (
+    <Box key={`decided:${l.id}`} flexDirection="column">
+      {text(k, l.rule, isSaved ? undefined : 'muted', { wrap: 'wrap' })}
+      <Box flexDirection="row">
+        {text(k, isSaved ? w.saved : w.skipped, isSaved ? 'ok' : 'muted')}
+        {text(k, ` · ${scopeWord(w, l.scope)} · ${w.ago(Math.max(0, at - (l.decidedAt ?? l.lastAt)))}`, 'muted')}
+      </Box>
+    </Box>
+  )
+}
+
+const tilde = (path: string, home: string) => (home !== '' && path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path)
+
+const kitFor = (ui: unknown, skin: KitSkin | null, surface: ReflectPanelArgs['surface'], columns: number) => kitOf(ui as KitUi, toneOf(skin), surface, columns)
+
+// ---------------------------------------------------------------------------
+// The /mods tab (claude-mods-hub PROTOCOL.md).
+
+async function panelOf($: EngineInterface, args: ReflectPanelArgs): Promise<ReflectPanel> {
+  lang = args.lang === 'pt' ? 'pt' : 'en'
+  const w = WORDS[lang]
+  const s = await syncSettings($)
+  await refreshBand($)
+  const root = await $.session.root()
+  const home = (await $.env.get('HOME')) ?? ''
+  const at = await $.clock.now()
+  const all = await items($)
+  const mine = all.filter(l => l.scope === 'global' || l.project === root)
+  const found = mine.filter(l => l.status === 'pending').sort(waitingFirst)
+  const elsewhere = all.filter(l => l.status === 'pending' && l.scope === 'project' && l.project !== root).length
+  const decided = mine.filter(l => l.status !== 'pending').sort((a, b) => (b.decidedAt ?? b.lastAt) - (a.decidedAt ?? a.lastAt))
+  const thisSession = await read($, savedThisSession)
+  const k = kitFor($.ui.resolve({ surface: args.surface, component: 'Pane' } as never), await skinOf($), args.surface, Math.max(24, args.columns - 4))
+  const tree = (el: RenderElement): ReflectItem => ({ kind: 'tree', tree: staticTree(el, k.t) })
+
+  const foundItems: ReflectItem[] = []
+  for (const l of found.slice(0, PANEL_ROWS)) {
+    foundItems.push(
+      tree(pendingRow(k, w, l, at)),
+      // The main action last: the save the check suggested.
+      { kind: 'action', id: `edit:${l.id}`, label: w.edit },
+      { kind: 'action', id: `skip:${l.id}`, label: w.skip },
+      { kind: 'action', id: `other:${l.id}`, label: l.scope === 'project' ? w.globalInstead : w.projectInstead },
+      { kind: 'action', id: `save:${l.id}`, label: l.scope === 'project' ? w.saveProject : w.saveGlobal, primary: true },
+    )
+  }
+  if (found.length > PANEL_ROWS) foundItems.push({ kind: 'text', text: w.moreHere(found.length - PANEL_ROWS) })
+  if (found.length === 0) foundItems.push({ kind: 'text', text: w.nothingFound })
+  if (elsewhere > 0) foundItems.push({ kind: 'text', text: w.otherProjects(elsewhere) })
+
+  const models = MODELS.some(m => m.value === s.model) ? MODELS : [...MODELS, { value: s.model, label: s.model }]
+  const modelName = models.find(m => m.value === s.model)?.label ?? s.model
+  const checking: ReflectItem[] = [
+    { kind: 'toggle', id: 'checking', label: w.checkLabel, help: w.checkHelp, value: !s.paused, scope: 'user' },
+    { kind: 'choice', id: 'model', label: w.model, help: w.modelHelp, value: s.model, options: models, scope: 'user' },
+    { kind: 'text', text: w.cost(modelName) },
+    { kind: 'text', text: w.rememberHint },
+  ]
+
+  const where: ReflectItem[] = [
+    { kind: 'info', label: w.thisRepo, value: tilde(await fileFor($, 'project', root), home) },
+    { kind: 'info', label: w.everywhere, value: tilde(await fileFor($, 'global', root), home) },
+    { kind: 'info', label: w.savedThisSession, value: String(thisSession.filter(r => r.scope === 'global' || r.project === root).length) },
+  ]
+
+  const history: ReflectItem[] = decided.slice(0, HISTORY_ROWS).map(l => tree(decidedRow(k, w, l, at)))
+  if (decided.length === 0) history.push({ kind: 'text', text: w.noHistory })
+  else history.push({ kind: 'text', text: w.totals(decided.filter(l => l.status === 'saved').length, decided.filter(l => l.status === 'skipped').length) })
+
+  const sections: ReflectSection[] = [
+    { id: 'found', title: found.length > 0 ? w.foundCount(found.length) : w.found, items: foundItems },
+    { id: 'checking', title: w.checking, items: checking },
+    { id: 'where', title: w.where, items: where },
+    { id: 'history', title: w.history, items: history },
+  ]
+  const summary = s.paused ? [w.paused, found.length > 0 ? w.toReview(found.length) : ''].filter(Boolean).join(' · ') : found.length > 0 ? w.toReview(found.length) : w.watching
+  const tone = s.paused ? 'muted' : found.length > 0 ? 'warn' : 'ok'
+  // A rule found or decided while the tab shows appears without a press.
+  return { title: w.title, summary, tone, sections, refreshMs: 5000 }
+}
+
+async function actOn($: EngineInterface, args: ReflectActArgs): Promise<ReflectActResult> {
+  const w = WORDS[lang]
+  if (args.id === 'checking') {
+    if (args.value !== 'on' && args.value !== 'off') return { message: w.badOption(String(args.value)) }
+    const isPaused = args.value === 'off'
+    await setSetting($, { paused: isPaused })
+    if (isPaused) queue.length = 0
+    return { message: isPaused ? w.checkingOff : w.checkingOn }
+  }
+  if (args.id === 'model') {
+    const model = args.value?.trim() ?? ''
+    if (model === '' || !(MODELS.some(m => m.value === model) || model === (await read($, settings)).model)) return { message: w.badOption(model) }
+    await setSetting($, { model })
+    return { message: w.modelSet(MODELS.find(m => m.value === model)?.label ?? model) }
+  }
+  const m = /^(save|other|edit|skip):(.+)$/.exec(args.id)
+  if (m !== null) {
+    const [, verb, id = ''] = m
+    const l = await waiting($, id)
+    if (l === undefined) {
+      await refreshBand($)
+      return { message: w.gone }
+    }
+    if (verb === 'save') return { message: await saveTo($, id, l.scope) }
+    if (verb === 'other') return { message: await saveTo($, id, l.scope === 'project' ? 'global' : 'project') }
+    if (verb === 'edit') return { message: (await edit($, id)).message }
+    return { message: await skip($, id) }
+  }
+  return { message: w.unknown(args.id) }
+}
+
+// ---------------------------------------------------------------------------
+// The catalog: every component the mod draws, from the same builders, in states worth seeing.
+
+const SAMPLE_AT = Date.UTC(2026, 9, 13, 12, 0, 0)
+const sample = (id: string, rule: string, scope: Learning['scope'], count: number, ago: number, status: Learning['status'] = 'pending'): Learning => ({
+  id,
+  rule,
+  scope,
+  project: '/repo',
+  count,
+  firstAt: SAMPLE_AT - ago,
+  lastAt: SAMPLE_AT - ago,
+  status,
+  confidence: 0.9,
+  ...(status === 'pending' ? {} : { decidedAt: SAMPLE_AT - ago }),
+})
+const SAMPLES = {
+  pnpm: sample('pnpm', 'Use pnpm, not npm, in this repo', 'project', 2, 4 * 60_000),
+  english: sample('english', 'Answer in English, even when I write in Portuguese', 'global', 1, 12 * 60_000),
+  staging: sample('staging', 'Staging runs on Cloud Run, not fly.io', 'project', 1, 40 * 60_000),
+  long: sample(
+    'long',
+    'Run the type check and the whole test suite before saying a change is done, and paste the last lines of their output',
+    'global',
+    3,
+    2 * 3_600_000,
+  ),
+  saved: sample('saved', 'Keep commit messages under 72 characters', 'global', 1, 3 * 3_600_000, 'saved'),
+  skipped: sample('skipped', 'Use the other config file', 'project', 1, 26 * 3_600_000, 'skipped'),
+}
+
+async function catalogOf($: EngineInterface, args: ReflectPanelArgs): Promise<ReflectCatalogEntry[]> {
+  const w = WORDS[args.lang === 'pt' ? 'pt' : 'en']
+  const columns = Math.max(24, (args.columns || 80) - 4)
+  const skin = await skinOf($)
+  const tone = toneOf(skin)
+  const bk = kitFor($.ui.resolve({ surface: args.surface, component: 'AbovePrompt' } as never), skin, args.surface, columns)
+  const k = kitFor($.ui.resolve({ surface: args.surface, component: 'Pane' } as never), skin, args.surface, columns)
+  const band = (list: Learning[], kit: Kit = bk) => bandTree(kit, w, list, () => NO_PRESS)
+  const { pnpm, english, staging, long, saved, skipped } = SAMPLES
+
+  const draws: [id: string, draw: () => RenderElement][] = [
+    ['band-one', () => band([pnpm])],
+    ['band-two', () => band([pnpm, english])],
+    ['band-more', () => band([pnpm, english, staging])],
+    ['band-global', () => band([english])],
+    ['band-narrow', () => band([long], kitOf(bk.ui, tone, args.surface, Math.min(columns, 56)))],
+    ['rule-row-pending', () => pendingRow(k, w, pnpm, SAMPLE_AT)],
+    ['rule-row-saved', () => decidedRow(k, w, saved, SAMPLE_AT)],
+    ['rule-row-skipped', () => decidedRow(k, w, skipped, SAMPLE_AT)],
+    ['found-empty', () => empty(k, 'found-empty', w.nothingFound, w.rememberHint)],
+  ]
+  return draws.map(([id, draw]) => {
+    const named = w.catalog[id] ?? { name: id, help: '' }
+    return { id, name: named.name, help: named.help, tree: staticTree(draw(), tone) }
+  })
+}
+
+// ---------------------------------------------------------------------------
+
+const langOfEnv = (value: string | undefined): ReflectLang => (/^pt/i.test(value ?? '') ? 'pt' : 'en')
+
+export const register: Register = (on, options: PluginOptions) => {
+  if (typeof options.model === 'string' && options.model.trim() !== '') configuredModel = options.model.trim()
 
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'reflect-queue', description: 'List the learnings reflect found here and their state' })
-    await $.command.register({ name: 'reflect-pause', description: 'Pause or resume the reflect check on your prompts' })
+    lang = langOfEnv((await $.env.get('LC_ALL')) ?? (await $.env.get('LANG')))
+    await syncSettings($).catch(() => undefined)
     await refreshBand($)
+    // Another session may change a setting or decide a rule: read the store again, slowly.
+    sync?.cancel()
+    sync = $.clock.every(SYNC_MS, () => {
+      void (async () => {
+        await syncSettings($)
+        await refreshBand($)
+      })().catch(() => undefined)
+    })
     return next(e)
   })
 
+  // `$.reflect` for the /mods hub: a call is the `reflect.panel`, `reflect.act` or `reflect.catalog`
+  // event, answered below with this session's `$`; the stub is the chain's floor.
+  on('engine.create', async ($, e, next) => {
+    const built = await next(e)
+    return { ...built, reflect: { panel: async () => ({ title: '', sections: [] }), act: async () => ({}), catalog: async () => [] } }
+  })
+  on('reflect.panel', async ($, e) => ({ value: await panelOf($, e) }))
+  on('reflect.act', async ($, e) => ({ value: await actOn($, e) }))
+  on('reflect.catalog', async ($, e) => ({ value: await catalogOf($, e) }))
+
   // Only cheap checks here: the prompt goes on at once, the work runs on a timer.
-  on('prompt.submit', ($, e, next) => {
+  on('prompt.submit', async ($, e, next) => {
     const text = e.text.trim()
     const isCandidate =
       HUMAN.has(e.origin.kind) &&
@@ -331,12 +732,12 @@ export const register: Register = (on, options) => {
       !isTrivial(text) &&
       (text.length <= MAX_PROMPT || remembered(text) !== undefined) &&
       !looksSecret(text)
-    if (isCandidate && queue.length < MAX_QUEUE) {
+    if (isCandidate && queue.length < MAX_QUEUE && !(await read($, settings)).paused) {
       queue.push(text)
       $.clock.after(0, () => void drain($).catch(() => undefined))
     }
     return next(e)
-  })
+  }).catch(($, e, next) => next(e))
 
   // Another session may have found or decided learnings: draw what the store holds now.
   on('turn.complete', async ($, e, next) => {
@@ -347,63 +748,39 @@ export const register: Register = (on, options) => {
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
     const root = await $.session.root()
-    const rules = (await read($, savedThisSession)).filter(r => r.scope === 'global' || r.project === root)
+    const rules = (await read($, savedThisSession)).filter((r: SavedRule) => r.scope === 'global' || r.project === root)
     if (rules.length === 0) return composed
     const text = ['Rules the user saved this session (they are in CLAUDE.md too; follow them):', ...rules.map(r => `- ${r.rule}`)].join('\n')
     return { sections: [...composed.sections, { id: 'reflect-mod:saved', text, scope: 'session' as const }] }
-  })
-
-  on('command.run', { command: 'reflect-queue' }, async $ => {
-    const root = await $.session.root()
-    const list = (await items($)).filter(l => l.scope === 'global' || l.project === root)
-    if (list.length === 0) return { text: 'Nothing found here yet.' }
-    const waiting = list.filter(l => l.status === 'pending')
-    const lines = [...waiting, ...list.filter(l => l.status !== 'pending').sort((a, b) => b.lastAt - a.lastAt)]
-      .slice(0, 40)
-      .map(l => `${l.status.padEnd(7)} ×${l.count} ${l.scope.padEnd(7)} ${l.rule}`)
-    return { text: [`${waiting.length} waiting, ${list.length} in all (here and global)`, ...lines].join('\n') }
-  })
-
-  on('command.run', { command: 'reflect-pause' }, async $ => {
-    const isPaused = (await $.store.get('paused')) !== true
-    await $.store.set('paused', isPaused)
-    if (isPaused) queue.length = 0
-    return { text: isPaused ? 'Paused. Your prompts are not checked.' : 'On. Short prompts are checked again.' }
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
     const list = await read($, pending)
     if (list.length === 0) return next(e)
-    const { Box, Button, Text } = $.ui.resolve(e)
-    const below = await next(e)
-    return (
-      <Box flexDirection="column">
-        {list.slice(0, BAND_ROWS).map(l => (
-          <Box key={`row:${l.id}`} flexDirection="column">
-            <Text color="green" wrap="wrap">
-              {`reflect · "${l.rule}"${l.count > 1 ? ` ×${l.count}` : ''}`}
-            </Text>
-            <Box flexDirection="row" gap={1}>
-              <Button
-                key={`save:${l.id}`}
-                variant="primary"
-                label={l.scope === 'project' ? 'Save to ./CLAUDE.md' : 'Save to ~/.claude/CLAUDE.md'}
-                onPress={() => saveTo($, l, l.scope)}
-              />
-              <Button
-                key={`other:${l.id}`}
-                label={l.scope === 'project' ? 'Global instead' : 'This repo instead'}
-                onPress={() => saveTo($, l, l.scope === 'project' ? 'global' : 'project')}
-              />
-              <Button key={`edit:${l.id}`} label="Edit" onPress={() => edit($, l)} />
-              <Button key={`skip:${l.id}`} label="Skip" onPress={() => skip($, l)} />
-            </Box>
-          </Box>
-        ))}
-        {list.length > BAND_ROWS && <Text dimColor>{`reflect · +${list.length - BAND_ROWS} more · /reflect-queue`}</Text>}
-        {below}
-      </Box>
+    // Other mods' bands go beneath; Claude Code's own placeholder ({ type: 'engine' }) is never nested: the desktop
+    // drops a band that nests it.
+    const drawn = await Promise.resolve(next(e)).catch(() => null)
+    const below = drawn && typeof drawn === 'object' && (drawn as { type?: string }).type !== 'engine' ? drawn : null
+    const k = kitFor($.ui.resolve(e), await skinOf($), e.surface, e.props.bodyColumns)
+    const w = WORDS[lang]
+    return bandTree(
+      k,
+      w,
+      list,
+      l => ({
+        save: () => saveTo($, l.id, l.scope).then(message => $.ui.toast(message)),
+        other: () => saveTo($, l.id, l.scope === 'project' ? 'global' : 'project').then(message => $.ui.toast(message)),
+        edit: () =>
+          edit($, l.id).then(done => {
+            if (!done.isDone) $.ui.toast(done.message)
+          }),
+        skip: () =>
+          skip($, l.id).then(message => {
+            if (message === WORDS[lang].gone) $.ui.toast(message)
+          }),
+      }),
+      below,
     )
   })
 }
