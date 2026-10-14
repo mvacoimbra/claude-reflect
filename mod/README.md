@@ -22,9 +22,12 @@ were reusable rules ([BACKLOG #1](../BACKLOG.md)). Regex cannot tell a rule from
 
 ## Install
 
+From the [claude-mods](https://github.com/mvacoimbra/claude-mods) marketplace, with the `/mods` hub it is configured in:
+
 ```bash
-claude plugin marketplace add bayramannakov/claude-reflect
-claude plugin install reflect-mod@claude-reflect-marketplace
+claude plugin marketplace add mvacoimbra/claude-mods
+claude plugin install mods@claude-mods
+claude plugin install reflect-mod@claude-mods
 ```
 
 Use either this or the Python plugin, not both (every correction would be captured twice).
@@ -34,15 +37,17 @@ Use either this or the Python plugin, not both (every correction would be captur
 1. **`prompt.submit`** - cheap checks only, so typing is never slowed: your own prompt (not one a plugin sent), not a
    slash command, not an acknowledgement ("ok", "да", "continue"), 500 characters or less, nothing that looks like a
    credential. Eligible prompts are queued; a timer does the rest outside the prompt's dispatch.
-2. **The check** - one `$.model.complete` call (`haiku`) with the policy in
+2. **The check** - one `$.model.complete` call (Haiku, or Sonnet if picked in `/mods`) with the policy in
    the system prompt and your message plus the assistant's previous reply passed as untrusted data. It answers
    `{is_rule, rule, scope, confidence}`; anything malformed, below 0.7, multi-line, over 200 characters or
    secret-shaped is dropped.
-3. **The band** - each found rule, full text, with:
-   - **Save to ./CLAUDE.md** or **Save to ~/.claude/CLAUDE.md** (the scope the check suggested),
+3. **The band** - each found rule in body text, where it goes and how often it came up under it, and:
+   - **Save to ./CLAUDE.md** or **Save to ~/.claude/CLAUDE.md** (the scope the check suggested; the main action),
    - **Global instead** / **This repo instead**,
    - **Edit** - puts `remember: <rule>` in an empty prompt box to reword,
    - **Skip**.
+
+   Two rules show at a time; the rest wait in `/mods`.
 4. **Save** re-reads the file just before writing and adds a bullet inside one marked section:
 
    ```markdown
@@ -55,8 +60,20 @@ Use either this or the Python plugin, not both (every correction would be captur
    A rule already in the file (as any bullet) is not added twice. Broken markers stop the write instead of guessing.
    The saved rule also goes into this session's system prompt (only while you stay in the project it belongs to).
 
-`remember: <rule>` skips the model and goes straight to the band. `/reflect-queue` lists what was found here and
-globally; `/reflect-pause` stops and resumes checking.
+`remember: <rule>` skips the model and goes straight to the band.
+
+## The Reflect tab in /mods
+
+There are no slash commands: everything is in the Reflect tab of `/mods`.
+
+- **Found rules** - every rule waiting here and globally, with its scope, count and age, and the same Edit, Skip and
+  save buttons as the band. Rules waiting in other projects are counted.
+- **Checking** - pause or resume the check, and the model it runs on (Haiku or Sonnet), with what one check costs.
+- **Where it saves** - this repo's and the global CLAUDE.md, and how many rules this session saved.
+- **Decided** - the latest saved and skipped rules.
+
+Settings and found rules live in the plugin's store, shared by every session: a pause, or a rule saved or skipped in one
+session, reaches the others within a few seconds.
 
 ## Cost and privacy
 
@@ -76,5 +93,5 @@ Code config directory) until you decide on them.
 
 ```bash
 claude plugin validate mod
-claude plugin test mod        # 10 tests, mocked model - free
+claude plugin test mod        # 16 tests, mocked model - free
 ```
