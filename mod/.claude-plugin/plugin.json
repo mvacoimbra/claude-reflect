@@ -1,7 +1,7 @@
 {
   "name": "reflect-mod",
-  "version": "3.3.0",
-  "description": "claude-reflect as a Claude Code mod: a model check on each short prompt finds reusable corrections (any language); a band above the prompt saves them to CLAUDE.md on one press",
+  "version": "3.4.0",
+  "description": "claude-reflect as a Claude Code mod: a model check on each short prompt finds reusable corrections (any language); a band above the prompt saves them to CLAUDE.md on one press, and its tab in /mods lists and configures them",
   "types": "./types/index.d.ts",
   "author": {
     "name": "Bayram Annakov",
